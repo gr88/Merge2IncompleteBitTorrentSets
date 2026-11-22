@@ -19,16 +19,24 @@ Usage (Ubuntu, stock python3 — standard library only):
 You will be prompted for any path you omit. Pasted paths may be quoted;
 leading/trailing quotes and whitespace are stripped, and ~ is expanded.
 
-After the merge, use the result in BiglyBT (or another v1-compatible client):
+Incomplete files that BiglyBT renamed with a ".az!" suffix ("Rename
+Incomplete Files") or moved into a ".dnd_az!" subfolder ("Do not
+download", sometimes with a prefix on the filename) are found
+automatically. The script prints which fallback each file used.
 
-    1. Add the same .torrent file (or verify the existing torrent entry).
-    2. Set the torrent's data location to the merged folder (the folder
-       that contains the content files — for a multi-file torrent this is
-       the folder that plays the role of info.name). You can also move or
-       rename the merged folder to where the client already expects the data.
-    3. Run "Force Recheck" (Force recheck / Re-check files).
-    4. The client will mark every piece that hashed correctly as done, and
-       will download only the pieces listed as still bad in the report.
+Set B is read only when set A's copy of a piece fails its SHA-1 hash.
+
+After the merge, use the result in BiglyBT (see the README for full notes):
+
+    1. Right-click the torrent > Stop. Do this before merging too, so
+       BiglyBT flushes its disk cache.
+    2. Either move the old set aside and rename the merged folder to the
+       torrent's original name in the original location, or right-click >
+       "Search For Existing Data Files..." and choose the folder that
+       *contains* the merged folder. Avoid "Move Data Files...".
+    3. Right-click > "Force Re-check", then Start.
+    4. If files were previously "Do not download", set them back to
+       Normal after the recheck or they stay skipped.
 
 A text report is written NEXT TO the merged folder (not inside it, so the
 folder stays clean for the client) as "<merged-folder-name>-report.txt".
@@ -36,6 +44,8 @@ folder stays clean for the client) as "<merged-folder-name>-report.txt".
 Supported: single-file and multi-file BitTorrent v1 torrents, including
 hybrid v1/v2 torrents that still carry v1 'pieces' hashes (typical of
 BiglyBT). Pure v2-only torrents (no v1 'pieces' field) are not supported.
+Use Linear storage (BiglyBT's default). Compact and Reorder modes do not
+store bytes at the torrent's real offsets, so those pieces will look bad.
 """
 
 from __future__ import annotations
@@ -334,11 +344,62 @@ def unique_output_dir(beside: Path, suffix: str = "-merged") -> Path:
     return candidate
 
 
+# BiglyBT on-disk names for incomplete / skipped files
+AZ_INCOMPLETE_SUFFIX = ".az!"       # "Rename Incomplete Files"
+DND_DIR_NAME = ".dnd_az!"           # "Do not download" subfolder
+
+
+def resolve_source_file(root: Path, tfile: TorrentFile) -> tuple[Path | None, str | None]:
+    """
+    Locate a torrent file on disk, including BiglyBT incomplete / DND names.
+
+    Lookup order — later options are used only if the previous path is not
+    a file (the normal path is preferred even if it is short or empty):
+
+      1. <root>/<relpath>
+      2. <root>/<relpath>.az!                       ("Rename Incomplete Files")
+      3. <root>/<parent>/.dnd_az!/<name>            ("Do not download")
+      4. any file named *<name> in that .dnd_az!    (DND, possible prefix)
+
+    Returns (path, reason). reason is None when the normal torrent path was
+    used. Both are None when nothing was found. Padding files are skipped.
+    """
+    if tfile.padding:
+        return None, None
+    primary = root / tfile.relpath
+    if primary.is_file():
+        return primary, None
+
+    az = primary.with_name(primary.name + AZ_INCOMPLETE_SUFFIX)
+    if az.is_file():
+        return az, "Rename Incomplete Files (.az!)"
+
+    dnd_dir = primary.parent / DND_DIR_NAME
+    exact = dnd_dir / primary.name
+    if exact.is_file():
+        return exact, "Do not download (.dnd_az!)"
+
+    if dnd_dir.is_dir():
+        matches: list[Path] = []
+        name = primary.name
+        try:
+            for child in dnd_dir.iterdir():
+                if child.is_file() and child.name != name and child.name.endswith(name):
+                    matches.append(child)
+        except OSError:
+            matches = []
+        if matches:
+            matches.sort(key=lambda p: (len(p.name), p.name))
+            return matches[0], "Do not download (.dnd_az!, prefixed)"
+
+    return None, None
+
+
 def _file_present(root: Path, tfile: TorrentFile) -> bool:
     if tfile.padding:
         return False
-    path = root / tfile.relpath
-    return path.is_file()
+    path, _reason = resolve_source_file(root, tfile)
+    return path is not None
 
 
 def detect_content_root(user_path: Path, meta: TorrentMeta) -> Path:
@@ -411,9 +472,9 @@ class FileHandleCache:
             self._handles.move_to_end(path)
             return handle
         if len(self._handles) >= self.max_open:
-            old_path, old = self._handles.popitem(last=False)
+            _old_path, old = self._handles.popitem(last=False)
             try:
-                old.close()
+                os.close(old)
             except OSError:
                 pass
         flags = os.O_RDONLY
@@ -497,12 +558,67 @@ def iter_piece_regions(meta: TorrentMeta, piece_index: int):
         i += 1
 
 
+class SourceLocator:
+    """Resolve and cache on-disk paths (including BiglyBT fallbacks) for one set."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._cache: dict[str, tuple[Path | None, str | None]] = {}
+
+    def locate(self, tfile: TorrentFile) -> tuple[Path | None, str | None]:
+        if tfile.padding:
+            return None, None
+        key = tfile.relpath.as_posix()
+        if key not in self._cache:
+            self._cache[key] = resolve_source_file(self.root, tfile)
+        return self._cache[key]
+
+    def path_for(self, tfile: TorrentFile) -> Path | None:
+        path, _reason = self.locate(tfile)
+        return path
+
+    def summarize(self, meta: TorrentMeta, label: str) -> str:
+        at_path = 0
+        via_fallback = 0
+        missing = 0
+        lines: list[str] = []
+        for tfile in meta.files:
+            if tfile.padding:
+                continue
+            path, reason = self.locate(tfile)
+            rel = tfile.relpath.as_posix()
+            if path is None:
+                missing += 1
+                lines.append(f"    {rel}: not found")
+            elif reason is None:
+                at_path += 1
+            else:
+                via_fallback += 1
+                try:
+                    shown = path.relative_to(self.root).as_posix()
+                except ValueError:
+                    shown = str(path)
+                lines.append(f"    {rel} -> {shown}  [{reason}]")
+        header = (
+            f"  {label} (content root: {self.root}): "
+            f"{at_path} at torrent path, {via_fallback} via fallback, {missing} missing"
+        )
+        return "\n".join([header] + lines) if lines else header
+
+
 def read_piece(
-    root: Path, meta: TorrentMeta, piece_index: int, cache: FileHandleCache
+    root: Path,
+    meta: TorrentMeta,
+    piece_index: int,
+    cache: FileHandleCache,
+    locator: SourceLocator | None = None,
 ) -> tuple[bytes, bool]:
     """
     Read one piece from a content root. Missing or short files contribute
     zero bytes (so the hash will fail unless those bytes really are zero).
+
+    If a SourceLocator is given, BiglyBT ".az!" / ".dnd_az!" fallback paths
+    are used when the torrent-relative path is missing.
 
     Returns (data, had_data). had_data is True if at least one non-padding
     byte was actually read from a file on disk (not filled in as a zero
@@ -515,7 +631,15 @@ def read_piece(
         if tfile.padding:
             # Padding is defined as zeros; leave the zero fill in place.
             continue
-        got = cache.pread(root / tfile.relpath, file_off, length)
+        if locator is not None:
+            src = locator.path_for(tfile)
+        else:
+            src = root / tfile.relpath
+            if not src.is_file():
+                src = None
+        if src is None:
+            continue
+        got = cache.pread(src, file_off, length)
         if got:
             buf[piece_off : piece_off + len(got)] = got
             had_data = True
@@ -557,17 +681,23 @@ def preallocate_output(root: Path, meta: TorrentMeta) -> None:
 class MergeStats:
     def __init__(self) -> None:
         self.total = 0
-        self.good_from_a = 0  # A hashed OK (used A); includes "both good"
+        self.good_from_a = 0  # A hashed OK (used A); B was not read
         self.good_from_b_only = 0
-        self.good_in_both = 0
         self.bad_in_both = 0
         self.bad_indexes: list[int] = []
+        self.pieces_b_read = 0  # pieces for which set B was actually opened
 
 
 def merge_sets(meta: TorrentMeta, root_a: Path, root_b: Path, out_root: Path) -> MergeStats:
     stats = MergeStats()
     stats.total = meta.num_pieces
     preallocate_output(out_root, meta)
+
+    locator_a = SourceLocator(root_a)
+    locator_b = SourceLocator(root_b)
+    print("Locating files (including BiglyBT .az! / .dnd_az! fallbacks)…")
+    print(locator_a.summarize(meta, "Set A"))
+    print(locator_b.summarize(meta, "Set B"))
 
     cache_a = FileHandleCache("r")
     cache_b = FileHandleCache("r")
@@ -578,30 +708,34 @@ def merge_sets(meta: TorrentMeta, root_a: Path, root_b: Path, out_root: Path) ->
 
     try:
         for i in range(meta.num_pieces):
-            data_a, had_a = read_piece(root_a, meta, i, cache_a)
-            data_b, had_b = read_piece(root_b, meta, i, cache_b)
+            data_a, had_a = read_piece(root_a, meta, i, cache_a, locator_a)
             expected = meta.piece_hashes[i]
             ok_a = _sha1(data_a) == expected
-            ok_b = _sha1(data_b) == expected
 
-            if ok_a and ok_b:
-                stats.good_in_both += 1
+            # Read set B only when A's piece fails its hash.
+            data_b = b""
+            had_b = False
+            ok_b = False
             if ok_a:
                 stats.good_from_a += 1
                 chosen = data_a
-            elif ok_b:
-                stats.good_from_b_only += 1
-                chosen = data_b
             else:
-                stats.bad_in_both += 1
-                stats.bad_indexes.append(i)
-                # Prefer whichever source actually has bytes, A first.
-                if had_a:
-                    chosen = data_a
-                elif had_b:
+                data_b, had_b = read_piece(root_b, meta, i, cache_b, locator_b)
+                stats.pieces_b_read += 1
+                ok_b = _sha1(data_b) == expected
+                if ok_b:
+                    stats.good_from_b_only += 1
                     chosen = data_b
                 else:
-                    chosen = data_a  # zeros (or whatever A produced)
+                    stats.bad_in_both += 1
+                    stats.bad_indexes.append(i)
+                    # Prefer whichever source actually has bytes, A first.
+                    if had_a:
+                        chosen = data_a
+                    elif had_b:
+                        chosen = data_b
+                    else:
+                        chosen = data_a  # zeros (or whatever A produced)
 
             write_piece(out_root, meta, i, chosen, cache_out)
 
@@ -650,15 +784,14 @@ def format_report(
         f"Merged output:     {out_root}",
         "",
         f"Pieces total:      {stats.total}",
-        f"Good from A:       {stats.good_from_a}  (A hashed OK; used A's copy, including pieces also good in B)",
+        f"Good from A:       {stats.good_from_a}  (A hashed OK; used A's copy; set B was not read for these pieces)",
         f"Good from B only:  {stats.good_from_b_only}  (A failed, B hashed OK; used B's copy)",
-        f"Good in both:      {stats.good_in_both}",
         f"Bad in both:       {stats.bad_in_both}  (still need to be downloaded)",
         f"Percent complete:  {pct:.2f}%  ({good}/{stats.total} pieces have a correct hash)",
         "",
     ]
     if stats.bad_indexes:
-        lines.append("Bad piece indexes (0-based, for Force Recheck / re-download):")
+        lines.append("Bad piece indexes (0-based, still needed after Force Re-check):")
         # Compact runs: 3-7, 10, 12-13
         runs: list[str] = []
         start = prev = stats.bad_indexes[0]
@@ -682,12 +815,19 @@ def format_report(
             lines.append(line)
         lines.append("")
     else:
-        lines.append("All pieces hashed correctly. Force Recheck should show 100% complete.")
+        lines.append("All pieces hashed correctly. Force Re-check should show 100% complete.")
         lines.append("")
-    lines.append("Next step in BiglyBT:")
-    lines.append("  Add this torrent (or open the existing one), set the data location to")
-    lines.append(f"  {out_root}")
-    lines.append("  then run Force Recheck. Only the 'bad in both' pieces will be re-downloaded.")
+    lines.append("Next steps in BiglyBT (exact menu names):")
+    lines.append("  Right-click the torrent > Stop  (also do this *before* merging, to flush the disk cache).")
+    lines.append("  Then either move the old set aside and rename the merged folder to the torrent's")
+    lines.append("  original name in the original location, or right-click > \"Search For Existing")
+    lines.append("  Data Files...\" and choose the folder that *contains* the merged folder:")
+    lines.append(f"    {out_root.parent}")
+    lines.append("  Avoid \"Move Data Files...\".")
+    lines.append("  Then right-click > \"Force Re-check\", then Start.")
+    lines.append("  If files were previously \"Do not download\", set them back to Normal after the")
+    lines.append("  recheck or they stay skipped. Use Linear storage (not Compact/Reorder).")
+    lines.append("  See the README for storage-mode notes and other options.")
     lines.append("")
     return "\n".join(lines)
 
