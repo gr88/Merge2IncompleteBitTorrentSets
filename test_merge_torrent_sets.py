@@ -302,9 +302,9 @@ class MultiFileMergeTests(MergeTestBase):
 
         text = report.read_text() + "\n" + proc.stdout
         self.assertIn("Pieces total:      5", text)
-        self.assertIn("Good from A:       3", text)  # pieces 0, 2, 4 (B not read for these)
+        self.assertIn("Good from A:       3", text)  # pieces 0, 2, 4
         self.assertIn("Good from B only:  1", text)  # piece 1
-        self.assertNotIn("Good in both:", text)  # B is not read when A hashes
+        self.assertIn("Good in both:      1", text)  # piece 2
         self.assertIn("Bad in both:       1", text)  # piece 3
         self.assertIn("80.00%", text)
 
@@ -434,7 +434,7 @@ class SingleFileMergeTests(MergeTestBase):
         self.assertIn("Pieces total:      4", text)
         self.assertIn("Good from A:       2", text)  # 0 and 2
         self.assertIn("Good from B only:  2", text)  # 1 and 3
-        self.assertNotIn("Good in both:", text)
+        self.assertIn("Good in both:      1", text)  # 2
         self.assertIn("Bad in both:       0", text)
         self.assertIn("100.00%", text)
         self.assertEqual(tree_fingerprint(ctx["setA"]), fp_a)
@@ -544,7 +544,7 @@ class HelpAndPromptTests(MergeTestBase):
             text=True,
         )
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("Force Re-check", proc.stdout)
+        self.assertIn("Force Recheck", proc.stdout)
         self.assertIn("BiglyBT", proc.stdout)
 
     def test_prompts_when_args_missing(self):
@@ -571,170 +571,6 @@ class HelpAndPromptTests(MergeTestBase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertTrue((ctx_dir / "pa-merged" / "x.bin").is_file())
         self.assertEqual((ctx_dir / "pa-merged" / "x.bin").read_bytes(), data)
-
-
-class BiglyBTFallbackTests(MergeTestBase):
-    """Item 1: locate files at .az! and .dnd_az! (including a prefixed name)."""
-
-    def test_resolve_source_file_lookup_order(self):
-        root = self.tmp / "root"
-        # Build a dummy TorrentFile-like by writing a tiny torrent and parsing it,
-        # then place only fallback copies on disk.
-        files = [("dir/clip.bin", b"hello-world-data-xxxx", False)]
-        torrent = self.tmp / "t.torrent"
-        write_torrent(torrent, "T", files, piece_length=32)
-        meta = m.parse_torrent(torrent)
-        tfile = meta.files[0]
-
-        # Missing entirely
-        path, reason = m.resolve_source_file(root, tfile)
-        self.assertIsNone(path)
-        self.assertIsNone(reason)
-
-        # .az! fallback
-        az = root / "dir" / "clip.bin.az!"
-        az.parent.mkdir(parents=True)
-        az.write_bytes(b"from-az")
-        path, reason = m.resolve_source_file(root, tfile)
-        self.assertEqual(path, az)
-        self.assertEqual(reason, "Rename Incomplete Files (.az!)")
-
-        # Exact .dnd_az! — used only when the torrent path and .az! are both missing
-        az.unlink()
-        dnd = root / "dir" / ".dnd_az!" / "clip.bin"
-        dnd.parent.mkdir(parents=True)
-        dnd.write_bytes(b"from-dnd")
-        path, reason = m.resolve_source_file(root, tfile)
-        self.assertEqual(path, dnd)
-        self.assertEqual(reason, "Do not download (.dnd_az!)")
-
-        # Prefixed name in .dnd_az!
-        dnd.unlink()
-        prefixed = root / "dir" / ".dnd_az!" / "tmp_clip.bin"
-        prefixed.write_bytes(b"from-prefix")
-        path, reason = m.resolve_source_file(root, tfile)
-        self.assertEqual(path, prefixed)
-        self.assertEqual(reason, "Do not download (.dnd_az!, prefixed)")
-
-        # Normal torrent path wins over any fallback that also exists
-        normal = root / "dir" / "clip.bin"
-        normal.write_bytes(b"from-normal")
-        az.write_bytes(b"from-az-again")
-        path, reason = m.resolve_source_file(root, tfile)
-        self.assertEqual(path, normal)
-        self.assertIsNone(reason)
-
-    def test_merge_reads_az_and_dnd_fallbacks_and_prints_them(self):
-        name = "MyShow"
-        files = make_odd_multifile()
-        torrent = self.tmp / "myshow.torrent"
-        blob = write_torrent(torrent, name, files)
-
-        # Place set A entirely in BiglyBT fallback locations (all good data).
-        # B is empty, so every good piece must have come from those fallbacks.
-        set_a = self.tmp / "setA" / name
-        set_b = self.tmp / "setB" / name
-        set_b.mkdir(parents=True)
-
-        def place(rel: str, data: bytes, dest: Path):
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-
-        by_rel = {rel: data for rel, data, padding in files if not padding}
-        place("a.bin", by_rel["a.bin"], set_a / "a.bin")  # normal path
-        place("b.bin", by_rel["b.bin"], set_a / "b.bin.az!")  # Rename Incomplete Files
-        place("sub/c.bin", by_rel["sub/c.bin"], set_a / "sub" / ".dnd_az!" / "c.bin")
-        place("d.bin", by_rel["d.bin"], set_a / ".dnd_az!" / "d.bin")
-        place("e.bin", by_rel["e.bin"], set_a / ".dnd_az!" / "tmp_e.bin")  # prefixed
-        place("empty.dat", by_rel["empty.dat"], set_a / "empty.dat")
-
-        proc = self.run_script(torrent, set_a, set_b)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        text = proc.stdout
-        self.assertIn("Rename Incomplete Files (.az!)", text)
-        self.assertIn("b.bin -> b.bin.az!", text)
-        self.assertIn("Do not download (.dnd_az!)", text)
-        self.assertIn("sub/c.bin -> sub/.dnd_az!/c.bin", text)
-        self.assertIn("d.bin -> .dnd_az!/d.bin", text)
-        self.assertIn("Do not download (.dnd_az!, prefixed)", text)
-        self.assertIn("e.bin -> .dnd_az!/tmp_e.bin", text)
-        self.assertIn("Good from A:       5", text)
-        self.assertIn("Bad in both:       0", text)
-        self.assertIn("100.00%", text)
-
-        out_dir = set_a.parent / "MyShow-merged"
-        # Output must use real torrent names, not .az! / .dnd_az!
-        self.assertTrue((out_dir / "b.bin").is_file())
-        self.assertFalse((out_dir / "b.bin.az!").exists())
-        self.assertFalse((out_dir / ".dnd_az!").exists())
-        self.assertFalse((out_dir / "sub" / ".dnd_az!").exists())
-        rebuilt = bytearray()
-        for rel, original, padding in files:
-            if padding:
-                rebuilt.extend(b"\x00" * len(original))
-                continue
-            data = (out_dir / rel).read_bytes()
-            self.assertEqual(len(data), len(original), rel)
-            rebuilt.extend(data)
-        self.assertEqual(bytes(rebuilt), blob)
-
-        # Inputs must be unchanged (still only fallback names, no writes into set A).
-        self.assertFalse((set_a / "b.bin").exists())
-        self.assertTrue((set_a / "b.bin.az!").is_file())
-
-
-class ReadBOnlyWhenAFailsTests(MergeTestBase):
-    """Item 6: set B is read only when A's piece fails its hash."""
-
-    def test_merge_sets_skips_reading_b_when_a_hashes(self):
-        files = make_odd_multifile()
-        torrent = self.tmp / "myshow.torrent"
-        blob = write_torrent(torrent, "MyShow", files)
-
-        # Same corruption pattern as the main multi-file test:
-        # piece 0 good A only, 1 good B only, 2 good in both, 3 bad both, 4 good A
-        # (B truncated so piece 4 is incomplete in B).
-        blob_a = apply_piece_corruption(blob, PIECE, 1)
-        blob_a = apply_piece_corruption(blob_a, PIECE, 3)
-        blob_b = apply_piece_corruption(blob, PIECE, 0)
-        blob_b = apply_piece_corruption(blob_b, PIECE, 3)
-        files_a = split_blob_into_files(blob_a, files)
-        files_b = []
-        for rel, data, padding in split_blob_into_files(blob_b, files):
-            if rel == "e.bin":
-                continue
-            if rel == "d.bin":
-                data = data[:27000]
-            files_b.append((rel, data, padding))
-
-        set_a = self.tmp / "A" / "MyShow"
-        set_b = self.tmp / "B" / "MyShow"
-        out = self.tmp / "A" / "MyShow-merged"
-        write_set(set_a, files_a)
-        write_set(set_b, files_b)
-
-        reads = []
-        orig = m.read_piece
-
-        def wrapped(root, meta, piece_index, cache, locator=None):
-            reads.append((Path(root), piece_index))
-            return orig(root, meta, piece_index, cache, locator)
-
-        m.read_piece = wrapped
-        try:
-            stats = m.merge_sets(m.parse_torrent(torrent), set_a, set_b, out)
-        finally:
-            m.read_piece = orig
-
-        self.assertEqual(stats.good_from_a, 3)       # pieces 0, 2, 4
-        self.assertEqual(stats.good_from_b_only, 1)  # piece 1
-        self.assertEqual(stats.bad_in_both, 1)       # piece 3
-        self.assertEqual(stats.pieces_b_read, 2)     # only pieces 1 and 3
-
-        b_reads = {idx for root, idx in reads if root == set_b}
-        a_reads = {idx for root, idx in reads if root == set_a}
-        self.assertEqual(a_reads, {0, 1, 2, 3, 4})
-        self.assertEqual(b_reads, {1, 3})
 
 
 class DetectRootUnitTests(MergeTestBase):

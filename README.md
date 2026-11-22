@@ -31,22 +31,9 @@ For each piece the script:
    **marked bad** so your BitTorrent client will re-download it after a
    recheck.
 
-Set B is read **only when A's piece fails** its hash, so a "good in both"
-count is not computed.
-
 Pieces that span more than one file, missing files, and truncated files are
-handled. Padding files (attribute `p`) are treated as zeros. They count
-toward piece offsets but do **not** need to be on disk and are not written
-into the output folder.
-
-If a file is not at its normal torrent path, the script also looks in the
-places BiglyBT uses for incomplete or skipped files, and prints which
-fallback it used:
-
-- `<filename>.az!` — "Rename Incomplete Files"
-- `<parent>/.dnd_az!/<filename>` — "Do not download"
-- any `*<filename>` in that `.dnd_az!` folder — "Do not download" with a
-  possible prefix on the name
+handled. Padding files (attribute `p`) count toward piece offsets but are
+not written into the output folder.
 
 ## Requirements
 
@@ -104,47 +91,26 @@ it, so the folder stays clean for your client) as
 `<merged-folder-name>-report.txt`. The same summary is printed on screen:
 
 - pieces total
-- good from A (A hashed; set B was not read for these pieces)
+- good from A (including pieces that were also good in B)
 - good from B only
+- good in both
 - bad in both (still need to be downloaded)
 - percent complete
 
-The merged folder is pre-sized to the torrent's **full length**, so you
-need that much free disk space (a full copy). Sparse files are used where
-the OS allows, but plan for the full size.
-
 Input folders are left untouched.
 
-## Before you merge (BiglyBT)
+## Next steps in your BitTorrent client
 
-- **Stop the torrent first:** right-click > **Stop**. This flushes
-  BiglyBT's disk cache so the files on disk are up to date.
-- Use **Linear** storage (BiglyBT's default). **Compact** and **Reorder**
-  storage modes do not store bytes at the torrent's real file offsets, so
-  this script will read those pieces as bad. If a set was downloaded in
-  Compact or Reorder mode, accept that those pieces will need to be
-  re-downloaded.
-- Incomplete files may appear as `<filename>.az!`, and "Do not download"
-  files may live under `.dnd_az!` (sometimes with a prefix). The script
-  looks there automatically.
+### BiglyBT
 
-## Next steps in BiglyBT
-
-Menu names below are BiglyBT's exact wording.
-
-1. If the torrent is still running, right-click > **Stop**.
-2. Point BiglyBT at the merged data. Either:
-   - Move the old download set aside, then rename the merged folder to the
-     torrent's original name in the original location, **or**
-   - Right-click > **"Search For Existing Data Files..."** and choose the
-     folder **containing** the merged folder (the parent of
-     `Something-merged`). Avoid **"Move Data Files..."**.
-3. Right-click > **"Force Re-check"**.
-4. Start the torrent. BiglyBT will keep every piece that hashes correctly
-   and download only the pieces that were still bad.
-5. If some files were previously set to **"Do not download"**, they stay
-   skipped after a recheck. Set those files back to **Normal** if you want
-   them downloaded or used.
+1. Open (or add) the **same** `.torrent` in BiglyBT.
+2. Set the torrent's **data location** to the merged folder (the folder
+   that contains the content files; for a multi-file torrent this is the
+   folder that plays the role of the torrent name). You can also move or
+   rename the merged folder to where the client already expects the data.
+3. Run **Force Recheck**.
+4. BiglyBT will mark every piece that hashes correctly as done, and will
+   download only the pieces that were still bad.
 
 ### Other clients
 
@@ -163,10 +129,8 @@ so it fills in the remaining pieces.
   `.torrent`). Do not merge sets from a different release, remux, or
   reissued torrent with a different info dictionary.
 - The output folder is pre-sized to the torrent's **full length**, so you
-  need disk space for a **full copy** (sparse files are used where the OS
+  need that much free disk space (sparse files are used where the OS
   allows, but plan for the full size).
-- **Compact / Reorder** storage in BiglyBT is not readable as a normal
-  file layout; those pieces will be treated as bad and re-downloaded.
 - A bad piece that neither set has correctly will still need to be
   downloaded from the swarm.
 
@@ -184,23 +148,15 @@ the merge keeps the hash-verified data and leaves the inputs unchanged.
 
 ## Alternative approaches
 
-You do not have to use this script. Other options:
+You do not have to use this script. Other options, depending on how
+comfortable you are mixing files by hand:
 
-- **File-level copy, then recheck.** Copy files that are *complete* in set
-  B into set A, then in BiglyBT right-click > **"Force Re-check"**. This
-  does **not** help files that are only partial in both sets — a whole-file
-  copy can overwrite good pieces in A with bad ones from B, or miss B's
-  good pieces inside a file that already exists in A.
-- **"Search For Existing Data Files..."** in BiglyBT, if files were
-  renamed or moved. Right-click the torrent and choose that command, then
-  pick the folder that contains the data. (This is also the safe way to
-  attach the merged folder; avoid **"Move Data Files..."**.)
-- **Two clients over localhost.** Run two clients with separate
-  profiles/ports — for example BiglyBT and DownLoadControlBT — add the
-  same torrent in both, and on the Peers tab add the other client as a
-  peer at `127.0.0.1:<port>`. Each can then feed the other the pieces it
-  already has. Caveat: DownLoadControlBT's peer-ban and rarest-only rules
-  may block this; disable those temporarily and re-enable them afterward.
+- **Client-side merge.** Point your client at set A and run a recheck. Then
+  copy into that folder any files (or larger/more complete files) that
+  exist in set B but are missing or shorter in A. Recheck again. The client
+  will accept whatever pieces now hash and will download the rest. This
+  works, but it is easy to overwrite good data if you copy whole files
+  blindly.
 - **qBittorrent / Transmission recheck.** Those clients (like BiglyBT) can
   recheck data you already have once the save path points at it. That is
   the right last step after any merge, including a manual one.
